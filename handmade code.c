@@ -46,8 +46,7 @@
 
 int badr[5];															// PCI 2.2 assigns 6 IO base addresses
 
-struct pci_dev_info info;
-void *hdl;
+
 
 uintptr_t dio_in;
 uintptr_t iobase[6];
@@ -65,11 +64,49 @@ pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 int condition = 0;
 
+void initial_setup(){
+    struct pci_dev_info info;
+    void *hdl;
+    int i; // local variable i for: for loop
+
+    memset(&info, 0, sizeof(info)); // clear the info structure
+    if (pci_attach(0)<0){
+        perror("Failed to attach to PCI device");
+        exit(EXIT_FAILURE);
+    }
+    // Vendor and Device ID
+    info.VendorId = 0x1307;
+    info.DeviceId = 0x01;
+
+    if ((hdl=pci_attach_device(0, PCI_SHARE|PCI_INIT_ALL, 0, &info)) == 0){
+        perror("Failed to attach to PCI device");
+        exit(EXIT_FAILURE);
+    }
+
+    // Determine assigned BADRn IO addresses for PCI-DAS1602
+    for (i=0; i<5; i++){
+        badr[i] = PCI_IO_ADDR(info.CpuBaseAddress[i]);
+    }
+
+    printf("\nReconfirm Iobase:\n");      //map I/O base address to user space
+    for (i=0; i<5; i++){                    // expect CpuBaseAddress to be the same as iobase for PC
+        iobase[i] = mmap_device_io(0x0f, badr[i]);
+        printf("Index %d : Address : %x\n", i, badr[i]);
+        printf("IOBASE : %x\n", iobase[i]);
+    }
+
+    // Modify thread control privity
+    if (ThreadCtl(_NTO_TCTL_IO, 0) == -1){
+        perror("Failed to modify thread control privity");
+        exit(1);
+    }
+}
+
 void* check_input(){
     while(1){
         pthread_mutex_lock(&mutex);
         condition = 2;
-        pthread_cond_wait(&cond);
+        pthread_cond_signal(&cond);
         pthread_mutex_unlock(&mutex);
     }
 }
@@ -109,38 +146,7 @@ void* generate_data(){
 int main(){
     printf("\fWelcome to the Waveform Generator\n\n");
 
-    memset(&info, 0, sizeof(info)); // clear the info structure
-    if (pci_attach(0)<0){
-        perror("Failed to attach to PCI device");
-        exit(EXIT_FAILURE);
-    }
-
-    // Vendor and Device ID
-    info.Vendor_id = 0x1307;
-    info.Device_id = 0x01;
-    
-    if ((hdl=pci_attach_device(0, PCI_SHARE|PCI_INIT_ALL, 0, &info)) == 0){
-        perror("Failed to attach to PCI device");
-        exit(EXIT_FAILURE);
-    }
-
-    // Determine assigned BADRn IO addresses for PCI-DAS1602
-    for (i=0; i<5; i++){
-        badr[i] = PCI_IO_ADDR(info.CpuBaseAddress[i]);
-    }
-
-    printf("\nReconfirm Iobase:\n");      //map I/O base address to user space
-    for (i=0; i<5; i++){                    // expect CpuBaseAddress to be the same as iobase for PC
-        iobase[i] = mmap_device_io(0x0f, badr[i]);
-        printf("Index %d : Address : %x\n", i, badr[i]);
-        printf("IOBASE : %x\n", iobase[i]);
-    }
-
-    // Modify thread control privity
-    if (ThreadCtl(_NTO_TCTL_IO, 0) == -1){
-        perror("Failed to modify thread control privity");
-        exit(1);
-    }
+    initial_setup();
 
         //***************************************** */
         //D/A Port Functions
