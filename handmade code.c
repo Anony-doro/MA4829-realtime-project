@@ -36,6 +36,14 @@
 #define DA_Data			iobase[4] + 0				// Badr4 + 0
 #define	DA_FIFOCLR		iobase[4] + 2				// Badr4 + 2
 	
+
+// Constants
+#define PI 3.14159265358979323846
+#define POINTS_PER_CYCLE 100
+#define MAX_FREQ 1000
+#define MIN_FREQ 1
+
+
 int badr[5];															// PCI 2.2 assigns 6 IO base addresses
 
 struct pci_dev_info info;
@@ -45,19 +53,58 @@ uintptr_t dio_in;
 uintptr_t iobase[6];
 uint16_t adc_in;
 
+
+//variables for waveform generation
 unsigned int i, count;
 unsigned short chan;
 unsigned int data[100];
 float delta, dummy;
 
+//variables for thread control
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+int condition = 0;
 
 void* check_input(){
     while(1){
         pthread_mutex_lock(&mutex);
-        pthread_cond_wait(&cond
+        condition = 2;
+        pthread_cond_wait(&cond);
+        pthread_mutex_unlock(&mutex);
     }
 }
 
+void* generate_data(){
+    while(1){
+        pthread_mutex_lock(&mutex);
+
+        while (condition == 1){
+            pthread_cond_wait(&cond);
+        }
+        condition = 2;
+        //file = fopen("wave1.txt", "w");
+
+        delta = (float) (2.0 * 3.142) / (float) POINTS_PER_CYCLE; //increment
+        for (i = 0; i < POINTS_PER_CYCLE; i++){
+            if (waveform == SINE){
+                dummy = (sinf(i*delta) + 1.0) * (0xffff / 2);
+                data[i] = (unsigned) dummy;
+            }
+        while(1){
+            for (i = 0; i < POINTS_PER_CYCLE; i++){
+                out16(DA_CTLREG, 0x0a23);
+                out16(DA_FIFOCLR, 0);
+                out16(DA_Data, (short) data[i]);
+               
+                out16(DA_CTLREG, 0x0a43);
+                out16(DA_FIFOCLR, 0);
+                out16(DA_Data, (short) data[i]);
+            }
+        }
+        pthread_mutex_unlock(&mutex);
+    }
+}
+}
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 int main(){
     printf("\fWelcome to the Waveform Generator\n\n");
@@ -101,6 +148,7 @@ int main(){
 
     pthread_create(NULL, NULL, &check_input, NULL); //later change check_input to check_input()
     pthread_create(NULL, NULL, &generate_data, NULL); //later change generate_data to generate_data()
-    return generate_wave(); //later change generate_wave to generate_wave()
+    //return generate_wave(); //later change generate_wave to generate_wave()
+    return 0;
 }
-`
+
