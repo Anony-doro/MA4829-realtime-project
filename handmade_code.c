@@ -39,7 +39,7 @@
 
 // Constants
 #define PI 3.14159265358979323846
-#define POINTS_PER_CYCLE 100
+#define WavePoints 100
 #define MAX_FREQ 1000
 #define MIN_FREQ 1
 
@@ -63,6 +63,14 @@ float delta, dummy;
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 int condition = 0;
+
+//global variable for wavefor type
+enum WaveFormType {
+    SINE,
+    SQUARE,
+    TRIANGLE,
+    SAWTOOTH
+};
 
 void initial_setup(){
     struct pci_dev_info info;
@@ -121,14 +129,14 @@ void* generate_data(){
         condition = 2;
         //file = fopen("wave1.txt", "w");
 
-        delta = (float) (2.0 * 3.142) / (float) POINTS_PER_CYCLE; //increment
-        for (i = 0; i < POINTS_PER_CYCLE; i++){
+        delta = (float) (2.0 * 3.142) / (float) WavePoints; //increment
+        for (i = 0; i < WavePoints; i++){
             if (waveform == SINE){
                 dummy = (sinf(i*delta) + 1.0) * (0xffff / 2);
                 data[i] = (unsigned) dummy;
             }
         while(1){
-            for (i = 0; i < POINTS_PER_CYCLE; i++){
+            for (i = 0; i < WavePoints; i++){
                 out16(DA_CTLREG, 0x0a23);
                 out16(DA_FIFOCLR, 0);
                 out16(DA_Data, (short) data[i]);
@@ -141,6 +149,20 @@ void* generate_data(){
         pthread_mutex_unlock(&mutex);
     }
 }
+}
+
+void generate_waveform(int type){
+    int i;
+    //amplitude = term_amplitude * pot_amplitude; // 1 to 5V
+    
+    delta=(2.0*PI)/100.0;
+    for (i = 0; i < WavePoints; i++){
+        switch (type){
+            case SINE:
+                data[i] = (unsigned) dummy;
+                break;
+        }
+    }
 }
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 int main(){
