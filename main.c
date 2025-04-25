@@ -1,14 +1,3 @@
-// 09September 2005
-//******************************************************************************************************
-// Performs basic I/O for the Omega PCI-DAS1602 
-//
-// Demonstration routine to demonstrate pci hardware programming
-// Demonstrated the most basic DIO and ADC and DAC functions
-// - excludes FIFO and strobed operations 
-//			22 Sept 2016 : Restructured to demonstrate Sine wave to DA
-//
-// G.Seet - 26 August 2005
-//******************************************************************************************************
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +12,9 @@
 #include <pthread.h>
 #include <time.h>
 #include <string.h>
-																
+#include <termios.h>
+
+// Hardware registers definition											
 #define	INTERRUPT		iobase[1] + 0				// Badr1 + 0 : also ADC register
 #define	MUXCHAN			iobase[1] + 2				// Badr1 + 2
 #define	TRIGGER			iobase[1] + 4				// Badr1 + 4
@@ -50,20 +41,37 @@
 #define	DA_FIFOCLR		iobase[4] + 2				// Badr4 + 2
 
 #define PI              3.14159265358979323846
-	
-int badr[5];															// PCI 2.2 assigns 6 IO base addresses
+#define POINTS_PER_CYCLE 100
+#define MAX_FREQ 1000
+#define MIN_FREQ 1
+#define FREQ_MULT 2
+#define FREQ_STEP 1
+#define AMP_STEP 1
+#define PULSE_WIDTH_RATIO 0.1
+
+														// PCI 2.2 assigns 6 IO base addresses
 
 //++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 
 // Global variables
+struct {
+    enum WaveformType type;
+    float frequency;
+    int amplitude;
+    int running;
+    unsigned int* data;
+} state;
 
-// 4 Waveform Types
+// Waveform Types
 enum WaveformType {
     SINE, // used for switch statements in waveformCheck()
     SQUARE,
     TRIANGULAR,
-    SAWTOOTH
+    SAWTOOTH,
+	PULSE,
+	CARDIAC,
+	NOTHING
 };
 
 // Set-up for PCI Device
@@ -71,6 +79,7 @@ struct pci_dev_info info;
 void *hdl;
 
 uintptr_t iobase[6];
+int badr[5];	
 uint16_t adc_in;
 
 unsigned int i, count; // global type declaration for counter of loops
@@ -78,6 +87,8 @@ unsigned int i, count; // global type declaration for counter of loops
 // for UI
 bool waveformInvalid; // Invalid input checker for waveform type selection
 bool freqInvalid; // Invalid input checker for frequency selection
+bool amplitudeInvalid; // Invalid input checker for amplitude selection
+
 int scanf_result;
 unsigned short user_option;
 char* temp_waveform; // takes in user input for waveform type as string
@@ -418,71 +429,45 @@ void* dataGenerate()
 
 int waveGenerate(void)
 {
-	while(1)
-	{
-		pthread_mutex_lock(&mutex);  // locks the current thread
+	float delta = (2.0 * PI) / POINTS_PER_CYCLE; //local variables
+    float value; //variable setup
 
-		while (condition == 2)       // check for data generation; if yes, do not generate wave; exits loop when condition == 1 (data generation has stopped)
-        {
-			pthread_cond_wait(&cond, &mutex); // data generation in process
-		}
-      	
-      	wave_file = fopen("wave.txt", "r");             // open wave.txt file to read the saved data
-		// resembles for loop, with n lines instead of n freq_points
-      	while (fgets(line, sizeof(line), wave_file))	// read each line in file
-      	{
-      		// str -> int conversion using atoi()
-			out16(DA_CTLREG,0x0a23);					// DA Enable, #0, #1, SW 5V unipolar	2/6
-			out16(DA_FIFOCLR, 0);						// Clear DA FIFO  buffer
-			out16(DA_Data, (short) atoi(line));
-
-			out16(DA_CTLREG,0x0a43);					// DA Enable, #1, #1, SW 5V unipolar	2/6
-			out16(DA_FIFOCLR, 0);						// Clear DA FIFO  buffer
-			out16(DA_Data, (short) atoi(line));	
-		}
-		fclose(wave_file);                              // close wave.txt file as all lines have been read by while loop
-
-      	condition = 1;                                  // ready to output wave
-      	pthread_cond_signal(&cond);      
-      	pthread_mutex_unlock(&mutex);                   // unlocks the current thread
-      	
-      	if (signalInterrupt == 1)
-      	{
-      		printf("Received Ctrl + C signal. Exiting program... \nExit status : 0\n");
-			reset();
-      		return 0; 			// status 0 if terminated using Ctrl + C
-      	}
-      	
-      	if ((temp_dio & 8) == 0) 	// if the main switch is turned off (mask = 1000)
-      	{
-      		printf("The main swtich is turned off.\nThe process is terminated.\nExit status: 2\n");
-      		reset();
-      		return 2; 			//  status 2 if terminated using main switch
-      	}
-   	}
-   return 0 ;
+    pthread_mutex_lock(&state.mutex);
+    
+    for(i = 0; i < POINTS_PER_CYCLE; i++) {
+        switch(state.type) {
+            case SINE:
+                value = sinf((float)(i * delta));
+                break;
+            case SQUARE:
+                value = (i < POINTS_PER_CYCLE/2) ? 1.0 : -1.0;
+                break;
+            case TRIANGLE:
+                value = (2.0 * fabs(i * (2.0/POINTS_PER_CYCLE) - 1.0) - 1.0);
+                break;
+            case SAWTOOTH:
+                value = (double) i / (double) (POINTS_PER_CYCLE -1);
+                break;
+           	case PULSE:
+                value = (i < POINTS_PER_CYCLE * PULSE_WIDTH_RATIO) ? 1.0 : 0.0;
+                break;
+           	case CARDIAC:
+                t =  (double) i / POINTS_PER_CYCLE;
+                value = exp(-200.0 * pow(t-0.2, 2)) - 0.1 * exp(-50.0 * pow(t - 0.35, 2)) + 0.05 * exp(-300.0 * pow(t-0.75, 2));
+                break;
+            case NOTHING:
+                value = 1;
+                break;
+        }
+        
+        // Scale value to DAC range and apply amplitude
+        state.data[i] = (unsigned int)((value + 1.0) * 0x7fff * state.amplitude / 100);
+    }
+    
+    pthread_mutex_unlock(&state.mutex);
 }
 
-int main(int argc, char* argv[]) {
-	signal(SIGINT, interrupt);
-
-	printf("\fDemonstration Routine for PCI-DAS 1602\n\n");
-	
-	if (argc != 3)
-    {
-        printf("Wrong number of arguments!\n");
-        display_usage();
-		printf("Incorrect usage. Exiting.\nExit status: 1\n");
-        return EXIT_FAILURE;
-    }
-
-    parse_arguments(argc, argv);
-    printf("\nWelcome to the waveform generator program!\n");
-    printf("Switch off the top switch to kill the program.\n");
-    printf("Toggle the other switch to trigger keyboard input.\n");
-    printf("Turn the potentiometer to change the amplitude anytime.\n");
-    printf("Current settings - Waveform: %s, Frequency: %i\n", temp_waveform, freq);
-
+void init_hardware(void) {
 	memset(&info, 0, sizeof(info));
 	if (pci_attach(0) < 0) {
   		perror("pci_attach");
@@ -514,6 +499,29 @@ int main(int argc, char* argv[]) {
 		perror("Thread Control");
 		exit(1);
 	}
+}
+
+int main(int argc, char* argv[]) {
+	signal(SIGINT, interrupt);
+
+	printf("\fDemonstration Routine for PCI-DAS 1602\n\n");
+	
+	if (argc != 3)
+    {
+        printf("Wrong number of arguments!\n");
+        display_usage();
+		printf("Incorrect usage. Exiting.\nExit status: 1\n");
+        return EXIT_FAILURE;
+    }
+
+    parse_arguments(argc, argv);
+    printf("\nWelcome to the waveform generator program!\n");
+    printf("Switch off the top switch to kill the program.\n");
+    printf("Toggle the other switch to trigger keyboard input.\n");
+    printf("Turn the potentiometer to change the amplitude anytime.\n");
+    printf("Current settings - Waveform: %s, Frequency: %i\n", temp_waveform, freq);
+
+	init_hardware();
 		
 	// thread functions
 	pthread_create(NULL, NULL, &userInput, NULL);
