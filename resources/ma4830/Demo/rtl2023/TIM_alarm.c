@@ -28,6 +28,7 @@ printf( "Pause returned with %d.  Sleep for 5 secs\n", rtn );
 alarm( 2 );
 rtn = sleep(5);
 
-printf( "Returned from sleep, only slept %d secs\n", 5-rtn );
+printf( "Returned from sleep, remaining sleep time: %d secs\n", 5-rtn );    // only slept 3 seconds. rtn =2 which means sleep period.
+//rtn shows the how much sleep is left.
 return 0;
 }

@@ -1,47 +1,37 @@
+// Waveform Generator for QNX
+// Based on PCI-DAS1602 hardware
+// MA4829 Real-time Project
 
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 #include <unistd.h>
-#include <signal.h>
 #include <hw/pci.h>
 #include <hw/inout.h>
 #include <sys/neutrino.h>
 #include <sys/mman.h>
 #include <math.h>
 #include <pthread.h>
-#include <time.h>
 #include <string.h>
+#include <signal.h>
 #include <termios.h>
+#include <time.h>
+#include <fcntl.h>
 
-// Hardware registers definition											
-#define	INTERRUPT		iobase[1] + 0				// Badr1 + 0 : also ADC register
-#define	MUXCHAN			iobase[1] + 2				// Badr1 + 2
-#define	TRIGGER			iobase[1] + 4				// Badr1 + 4
-#define	AUTOCAL			iobase[1] + 6				// Badr1 + 6
-#define DA_CTLREG		iobase[1] + 8				// Badr1 + 8
+// Hardware control registers for PCI-DAS1602
+#define INTERRUPT   iobase[1] + 0
+#define MUXCHAN    iobase[1] + 2
+#define TRIGGER    iobase[1] + 4
+#define AUTOCAL    iobase[1] + 6
+#define DA_CTLREG  iobase[1] + 8
+#define AD_DATA    iobase[2] + 0
+#define AD_FIFOCLR iobase[2] + 2
+#define DA_Data    iobase[4] + 0
+#define DA_FIFOCLR iobase[4] + 2
+#define DIO_PORTA  iobase[3] + 4
 
-#define	AD_DATA			iobase[2] + 0				// Badr2 + 0
-#define	AD_FIFOCLR		iobase[2] + 2				// Badr2 + 2
-
-#define	TIMER0			iobase[3] + 0				// Badr3 + 0
-#define	TIMER1			iobase[3] + 1				// Badr3 + 1
-#define	TIMER2			iobase[3] + 2				// Badr3 + 2
-#define	COUNTCTL		iobase[3] + 3				// Badr3 + 3
-#define	DIO_PORTA		iobase[3] + 4				// Badr3 + 4
-#define	DIO_PORTB		iobase[3] + 5				// Badr3 + 5
-#define	DIO_PORTC		iobase[3] + 6				// Badr3 + 6
-#define	DIO_CTLREG		iobase[3] + 7				// Badr3 + 7
-#define	PACER1			iobase[3] + 8				// Badr3 + 8
-#define	PACER2			iobase[3] + 9				// Badr3 + 9
-#define	PACER3			iobase[3] + a				// Badr3 + a
-#define	PACERCTL		iobase[3] + b				// Badr3 + b
-
-#define DA_Data			iobase[4] + 0				// Badr4 + 0
-#define	DA_FIFOCLR		iobase[4] + 2				// Badr4 + 2
-
-#define PI              3.14159265358979323846
-#define POINTS_PER_CYCLE 100
+// Constants
+#define PI 3.14159265358979323846
+#define POINTS_PER_CYCLE 20
 #define MAX_FREQ 1000
 #define MIN_FREQ 1
 #define FREQ_MULT 2
@@ -49,395 +39,104 @@
 #define AMP_STEP 1
 #define PULSE_WIDTH_RATIO 0.1
 
-														// PCI 2.2 assigns 6 IO base addresses
-
-//++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
-
-
-// Global variables
-struct {
-    enum WaveformType type;
-    float frequency;
-    int amplitude;
-    int running;
-    unsigned int* data;
-} state;
-
-// Waveform Types
+// Waveform types
 enum WaveformType {
-    SINE, // used for switch statements in waveformCheck()
+    SINE,
     SQUARE,
-    TRIANGULAR,
+    TRIANGLE,
     SAWTOOTH,
-	PULSE,
-	CARDIAC,
-	NOTHING
+    PULSE,
+    CARDIAC,
+    NOTHING
 };
 
-// Set-up for PCI Device
-struct pci_dev_info info;
-void *hdl;
+/* Program state structure to track current waveform settings */
+struct {
+    enum WaveformType type;         /* Current waveform type */
+    float frequency;                /* Current frequency in Hz */
+    int amplitude;                  /* Current amplitude (0-100%) */
+    int running;                    /* Program running flag */
+    unsigned int* data;             /* Waveform data buffer */
+} state;
 
-uintptr_t iobase[6];
-int badr[5];	
-uint16_t adc_in;
+/* Global variables for program operation */
+int i;                             /* General purpose counter */
+double t;                          /* Time variable for waveform generation */
+int freq;                          /* Temporary frequency storage */
+int amp;                           /* Temporary amplitude storage */
+FILE* file;                        /* File handle for settings */
+char* equals;                      /* String parsing helper */
+char* value;                       /* String parsing helper */
+char* newline;                     /* String parsing helper */
+int fd;                            /* File descriptor for logging */
+float frequency;                   /* Working frequency value */
+int amplitude;                     /* Working amplitude value */
+int mode;                         /* Input mode (1=keyboard, 2=potentiometer) */
 
-unsigned int i, count; // global type declaration for counter of loops
-
-// for UI
-bool waveformInvalid; // Invalid input checker for waveform type selection
-bool freqInvalid; // Invalid input checker for frequency selection
-bool amplitudeInvalid; // Invalid input checker for amplitude selection
-
-int scanf_result;
-unsigned short user_option;
-char* temp_waveform; // takes in user input for waveform type as string
-int temp_freq;
-int freq = 100;
-
-// A/D Input
-unsigned short chan; // channel for A/D inputs
-int temp_dio;		// record current dio, to compare with previous dio
-uintptr_t dio_in = 0xff;
-int temp_amp;				// record current potentiometer reading, to compare with previous amp
-int amp = 0xffff; // initialise amplitude as 1
-
-// Wave Generation
-unsigned short waveform; // stores waveform type (SINE, SQUARE, TRIANGULAR, SAWTOOTH) retrieved from enum WaveformType
-unsigned int* data; 	// initilalise an int array pointer
-float delta, dummy;
-float temp;
-int freq_points;
-int signalInterrupt = 0;
-int abort_signal = 0;
-
-// file IO
-FILE *file;				// temp file writer to store generated data
-FILE *wave_file;		// wave file reader to generate wave 
-char line[256];			// act as buffer for file IO
-
-// threading	
+/* Thread synchronization */
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
-unsigned short condition = 0;  	// 0: initial, 1: generating wave, 2: generating data
 
-// Functions Declaration
-void interrupt();
-void reset();
-void parse_arguments(int argc, char *argv[]);
-void display_usage();
-void update_settings();
-void waveformCheck();
-void freqCheck();
-void toggle();
-void potentiometer();
-void create_data_arr();
+/* PCI hardware interface variables */
+struct pci_dev_info info;
+void *hdl;
+uintptr_t iobase[6];
+int badr[5];
 
-// Thread Functions
-void* userInput();
-void* dataGenerate();
-int waveGenerate();
+/* ADC variables */
+uint16_t adc_in;                   /* ADC input value */
+unsigned int count;                /* Channel counter */
+unsigned short chan;               /* Current channel */
 
+/* Thread identifiers */
+pthread_t input_tid;               /* Keyboard/command input thread */
+pthread_t wave_tid;                /* Waveform generation thread */
+pthread_t analog_tid;              /* Potentiometer input thread */
 
-void interrupt() 
-{
-	signalInterrupt = 1;
-}
-
-void reset()
-{
-										// Unreachable code
-										// Reset DAC to 5v
-	out16(DA_CTLREG, (short) 0x0a23);	
-	out16(DA_FIFOCLR, (short) 0);			
-	out16(DA_Data, 0x7fff);				// Mid range - Unipolar
-	
-	out16(DA_CTLREG, (short) 0x0a43);	
-	out16(DA_FIFOCLR, (short) 0);			
-	out16(DA_Data, 0x7fff);				
-
-	printf("\n\nExit Demo Program\n");
-	pci_detach_device(hdl);
-		
-	free(data);
-	if (wave_file != NULL)
-    {
-    	fclose(wave_file);
-		printf("Sucessfully written to file.\n");
-	}
-}
-
-void parse_arguments(int argc, char *argv[])
-{
-    temp_waveform = argv[1];
-    temp_freq = atoi(argv[2]);
-    
-    waveformCheck(argc, argv);
-    freqCheck(argc, argv);
-}
-
-void display_usage() 
-{
-    printf("Usage: program_name [waveform_type] [frequency]\n");
-    printf("Supported waveform types: sine, square, triangular, sawtooth\n");
-    printf("Frequency range: 1 - 1000\n");
-}
-
-void update_settings() 
-{
-	printf("\nKeyboard input option\n");
-	printf("Key in the following number if you want to update the respective field\n");
-	printf("1: Waveform\n");
-	printf("2: Frequency\n");
-	user_option = 0;
-
-	do 								// make sure user option is correct
-	{
-		printf("Your input (1 / 2): \n");
-		scanf("%d", &user_option);
-		while (getchar() != '\n');	// used to clear buffer, handle error when input not numeric
-	}
-	while (user_option != 1 && user_option != 2);
-
-	if (user_option == 1)
-	{
-		printf("\nPlease select from these 4 options: sine / square / triangular / sawtooth\n");
-		printf("New waveform: \n");
-		scanf("%s", temp_waveform);
-        waveformCheck();
-	}
-	if (user_option == 2)
-	{
-		printf("New frequency (1 - 1000): \n");
-		scanf_result = scanf("%d", &temp_freq);
-		while (getchar() != '\n'); 	// used to clear buffer, handle error when input not numeric
-		if (scanf_result == 0) 		// if result == 0 means scanf face error, hence change temp_freq = -1
-		{
-			temp_freq = -1;			// help freq() detect incorrect input
-		}
-		freqCheck();
-	}
-	
-	printf("Success!\n");
-	printf("New setting - Waveform: %s, Frequency: %i\n", temp_waveform, freq);
-	printf("\nPlease toggle the switches again to trigger keyboard input\n");
-
-	condition = 2; // data generation
-	pthread_cond_signal( &cond );      
-	pthread_mutex_unlock( &mutex );
-}
-
-void waveformCheck()
-{
-    do
-    {
-        waveformInvalid = false; // Initialises as false
-
-        if (strcmp(str_to_upper(temp_waveform), "SINE") == 0) // changes all characters of user input to uppercase for better UX
-        {
-            waveform = SINE;       // 0
-        }
-        else if (strcmp(str_to_upper(temp_waveform), "SQUARE") == 0) 
-        {
-            waveform = SQUARE;     // 1
-        } 
-        else if (strcmp(str_to_upper(temp_waveform), "TRIANGULAR") == 0)
-        {
-            waveform = TRIANGULAR; // 2
-        } 
-        else if (strcmp(str_to_upper(temp_waveform), "SAWTOOTH") == 0)
-        {
-            waveform = SAWTOOTH;   // 3
-        }   // if any of these 4 if statements is performed, waveformInvalid remains unchanged as false & this do-while loop terminates
-        else
-        {
-            waveformInvalid = true;
-            printf("\nInvalid waveform.\n");
-            printf("Please select from these 4 options: Sine / Square / Triangular / Sawtooth\n");
-            printf("New waveform: \n");
-            scanf("%s", temp_waveform); // takes in new user input for waveform type
-        }
+// Initialize PCI card and set up hardware registers
+void init_hardware(void) {
+    /* Initialize PCI hardware connection */
+    memset(&info, 0, sizeof(info));
+    if(pci_attach(0) < 0) {
+        perror("pci_attach");
+        exit(EXIT_FAILURE);
     }
-    while (waveformInvalid); // loop continues until any of the 4 if statements is performed
-}
 
-void freqCheck()
-{
-    do
-    {
-        freqInvalid = false;                   // Initialises as false
-        if (temp_freq < 1 || temp_freq > 1000) // user input frequency is out of range
-        {
-            freqInvalid = true;
-            printf("Invalid frequency, please input a value in range of (1 - 1000): \n");
-            printf("New frequency: \n");
-            scanf("%d", &temp_freq);
-            while (getchar() != '\n'); // used to clear buffer, handle error when input not numeric
-        }
-        else
-        {
-            freq = temp_freq;
-            create_data_arr();
-        }
+    /* Configure PCI device parameters */
+    info.VendorId = 0x1307;
+    info.DeviceId = 0x01;
+
+    /* Attach to PCI device */
+    if ((hdl = pci_attach_device(0, PCI_SHARE|PCI_INIT_ALL, 0, &info)) == 0) {
+        perror("pci_attach_device");
+        exit(EXIT_FAILURE);
     }
-    while (freqInvalid); // loop continues until frequency is in range
-}
-
-void toggle()
-{	
-								//*****************************************************************************
-								//Digital Port Functions
-								//*****************************************************************************	
-	out8(DIO_CTLREG, 0x90);		// Port A : Input,  Port B : Output,  Port C (upper | lower) : Output | Output			
-
-	temp_dio = in8(DIO_PORTA); 	// Read Port A
-																						
-	out8(DIO_PORTB, temp_dio);	// output Port A value -> write to Port B
-}
-
-void potentiometer()
-{
-								//******************************************************************************
-								// ADC Port Functions
-								//******************************************************************************
-								// Initialise Board								
-	out16(INTERRUPT,0x60c0);	// sets interrupts	 - Clears			
-	out16(TRIGGER,0x2081);		// sets trigger control: 10MHz, clear, Burst off,SW trig. default:20a0
-	out16(AUTOCAL,0x007f);		// sets automatic calibration : default
-
-	out16(AD_FIFOCLR,0); 		// clear ADC buffer
-	out16(MUXCHAN,0x0D00);		// Write to MUX register - SW trigger, UP, SE, 5v, ch 0-0 	
-								// x x 0 0 | 1  0  0 1  | 0x 7   0 | Diff - 8 channels
-								// SW trig |Diff-Uni 5v| scan 0-7| Single - 16 channels
-	//printf("\n\nRead multiple ADC\n");
-	count = 0x00;
-		
-	while (count < 0x02)
-    {
-		chan = ((count & 0x0f) << 4) | (0x0f & count);
-		out16(MUXCHAN, (0x0D00 | chan));			// Set channel	 - burst mode off.
-		delay(1);							// allow MUX to settle
-		out16(AD_DATA, 0); 					// start ADC
-		while (!(in16(MUXCHAN) & 0x4000));
-
-		adc_in = in16(AD_DATA);
-		if (count == 0x00)
-        {
-			amp = adc_in;
-		}
-
-		fflush( stdout );
-  		count++;
-  		delay(5);							// Write to MUX register - SW trigger, UP, DE, 5v, ch 0-7 	
-  	}
-}
-
-void create_data_arr()
-{
-	// 87000 is found to be a good value to map expected freq to # of freq points needed.
-	// the exact time taken to run waveGenerate() will produce desired freq
-	temp = (float) 87000 / freq;						// temp to calculate frequency points iteration	needed			
-	freq_points = (int) (temp + 0.5); 					// round over
-	data = (int *) malloc(freq_points * sizeof(int)); 	// allocate memory for size of freq
-}
-
-void* userInput()
-{
-	while (1)
-   {
-   		temp_amp = amp; // set temp_amp as the previous measured amp value
-   		toggle();
-		potentiometer();
-		pthread_mutex_lock( &mutex );
-
-      	if (amp < temp_amp - 100 || amp > temp_amp + 100) 
-      	{
-      		printf("\a");
-      		condition = 2; 		// data generation
-      	}
-      	
-      	if (dio_in != temp_dio && (temp_dio & 8) != 0) // if dio is updated. and not main switch turned off
-      	{
-      		printf("\a");
-      		update_settings();
-      	}
-      	dio_in = temp_dio;		// update dio_in
-      	pthread_cond_signal( &cond );      
-      	pthread_mutex_unlock( &mutex );
-   	}
-
-   	return 0;
-}
-
-
-void* dataGenerate()
-{
-	while (1)
-    {
-		pthread_mutex_lock(&mutex); // 
-
-		while (condition == 1) // while wave is being generated, pthread for data generation (condition == 2) is on hold
-        {
-			pthread_cond_wait( &cond, &mutex );
-		}
-
-		condition = 2; // data generation mode
-		file = fopen("wave1.txt", "w");
-		for (i = 0; i < freq_points; i++)
-        {
-			if (waveform == SINE) 
-			{
-				delta = (float) (2.0 * PI) / (float) freq_points;	// increment
-				dummy = (sinf(i*delta) + 1.0) * amp / 2;				// add offset +  scale
-			}
-			if (waveform == SQUARE)
-			{
-				if (i < freq_points / 2) {
-					dummy= 0x0000;
-				}
-				else {
-					dummy = amp;
-				}
-			}
-			if (waveform == TRIANGULAR) {
-				if (i < freq_points / 2) {
-					dummy= (float) i / (float) (freq_points / 2) * amp;
-				}
-				else {
-					dummy = (float) (freq_points - 1 - i) / (float) (freq_points / 2) * amp;
-				}
-			}
-			if (waveform == SAWTOOTH) {
-				delta = (float) amp / (float) freq_points;	// gradient
-				dummy = i * delta;
-			}
-		
-			data[i] = (unsigned) dummy;	
-			fprintf(file, "%d\n", data[i]);
-		}
-		fclose(file);
-		rename("wave1.txt", "wave.txt");  // once the file is ready, rename it to wave
-    	// if the amp is the same, then condition will remain as 1
-		condition = 1; // ready to output wave
-      	
-		pthread_cond_signal( &cond );
-		pthread_mutex_unlock( &mutex );
-	}
-	
-	return 0;
-}
-
-int waveGenerate(void)
-{
-	float delta = (2.0 * PI) / POINTS_PER_CYCLE; //local variables
-    float value; //variable setup
-
-    pthread_mutex_lock(&state.mutex);
     
+    /* Map I/O base addresses */
+    for(i = 0; i < 5; i++) {
+        badr[i] = PCI_IO_ADDR(info.CpuBaseAddress[i]);
+        iobase[i] = mmap_device_io(0x0f, badr[i]);
+    }
+    
+    /* Set up thread I/O privileges */
+    if(ThreadCtl(_NTO_TCTL_IO, 0) == -1) {
+        perror("Thread Control");
+        exit(1);
+    }
+}
+
+/* Generate waveform data based on current settings */
+void generate_waveform(void) {
+    float delta = (2.0 * PI) / POINTS_PER_CYCLE;
+    float value;
+
+    pthread_mutex_lock(&mutex);
+    
+    /* Generate points for one complete cycle */
     for(i = 0; i < POINTS_PER_CYCLE; i++) {
         switch(state.type) {
             case SINE:
-                value = sinf((float)(i * delta));
+                value = sin(i * delta);
                 break;
             case SQUARE:
                 value = (i < POINTS_PER_CYCLE/2) ? 1.0 : -1.0;
@@ -446,85 +145,728 @@ int waveGenerate(void)
                 value = (2.0 * fabs(i * (2.0/POINTS_PER_CYCLE) - 1.0) - 1.0);
                 break;
             case SAWTOOTH:
-                value = (double) i / (double) (POINTS_PER_CYCLE -1);
+                value = (2.0 *((double) i / (double) (POINTS_PER_CYCLE -1)) -1.0);
                 break;
-           	case PULSE:
+            case PULSE:
                 value = (i < POINTS_PER_CYCLE * PULSE_WIDTH_RATIO) ? 1.0 : 0.0;
                 break;
-           	case CARDIAC:
-                t =  (double) i / POINTS_PER_CYCLE;
-                value = exp(-200.0 * pow(t-0.2, 2)) - 0.1 * exp(-50.0 * pow(t - 0.35, 2)) + 0.05 * exp(-300.0 * pow(t-0.75, 2));
+            case CARDIAC:
+                /* Simulate cardiac waveform using Gaussian functions */
+                t = (double) i / POINTS_PER_CYCLE;
+                value = exp(-200.0 * pow(t-0.2, 2)) - 
+                       0.1 * exp(-50.0 * pow(t - 0.35, 2)) + 
+                       0.05 * exp(-300.0 * pow(t-0.75, 2));
                 break;
             case NOTHING:
                 value = 1;
                 break;
         }
         
-        // Scale value to DAC range and apply amplitude
+        /* Scale value to DAC range and apply amplitude */
         state.data[i] = (unsigned int)((value + 1.0) * 0x7fff * state.amplitude / 100);
     }
     
-    pthread_mutex_unlock(&state.mutex);
+    pthread_mutex_unlock(&mutex);
 }
 
-void init_hardware(void) {
-	memset(&info, 0, sizeof(info));
-	if (pci_attach(0) < 0) {
-  		perror("pci_attach");
-  		exit(EXIT_FAILURE);
-  	}
-
-												/* Vendor and Device ID */
-	info.VendorId=0x1307;
-	info.DeviceId=0x01;
-
-	if ((hdl=pci_attach_device(0, PCI_SHARE|PCI_INIT_ALL, 0, &info)) == 0) {
-		perror("pci_attach_device");
-		exit(EXIT_FAILURE);
-	}
-												// Determine assigned BADRn IO addresses for PCI-DAS1602			
-
-	//printf("\nDAS 1602 Base addresses:\n\n");
-	for (i = 0; i < 5; i++) {
-		badr[i] = PCI_IO_ADDR(info.CpuBaseAddress[i]);
-	}
-	
-	//printf("\nReconfirm Iobase:\n");  		// map I/O base address to user space						
-	for (i = 0; i < 5; i++)
-    {					// expect CpuBaseAddress to be the same as iobase for PC
-		iobase[i] = mmap_device_io(0x0f, badr[i]);
-	}													
-												// Modify thread control privity
-	if (ThreadCtl(_NTO_TCTL_IO, 0) == -1) {
-		perror("Thread Control");
-		exit(1);
-	}
+/* Log waveform settings to file */
+void write_file(void) {
+    char buffer[256];
+    int len;
+    
+    /* Create/open log file */
+    fd = open("waveform_log.txt", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("Cannot open log file");
+        exit(1);
+    }
+    
+    /* Write current settings to log */
+    len = sprintf(buffer, "Initial settings:\n");
+    write(fd, buffer, len);
+    len = sprintf(buffer, "Waveform type: %d\n", state.type);
+    write(fd, buffer, len);
+    len = sprintf(buffer, "Frequency: %.2f Hz\n", state.frequency);
+    write(fd, buffer, len);
+    len = sprintf(buffer, "Amplitude: %d%%\n\n", state.amplitude);
+    write(fd, buffer, len);
 }
 
-int main(int argc, char* argv[]) {
-	signal(SIGINT, interrupt);
+/* Save current settings to default configuration file */
+void save_default_settings(void) {
+    pthread_mutex_lock(&mutex);
+    file = fopen("default.txt", "w");
+    if (!file) {
+        printf("Error: Could not save default settings\n");
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
+    
+    /* Write current waveform settings to file */
+    fprintf(file, "waveform=%s\n",
+        state.type == SINE ? "sine" :
+        state.type == SQUARE ? "square" :
+        state.type == TRIANGLE ? "triangle" :
+        state.type == SAWTOOTH ? "sawtooth" :
+        state.type == PULSE ? "pulse" :
+        state.type == CARDIAC ? "cardiac" : "nothing");
+    fprintf(file, "freq=%.2f\n", state.frequency);
+    fprintf(file, "amp=%d\n", state.amplitude);
+    
+    fclose(file);
+    pthread_mutex_unlock(&mutex);
+}
 
-	printf("\fDemonstration Routine for PCI-DAS 1602\n\n");
-	
-	if (argc != 3)
-    {
-        printf("Wrong number of arguments!\n");
-        display_usage();
-		printf("Incorrect usage. Exiting.\nExit status: 1\n");
-        return EXIT_FAILURE;
+/* Save current settings to specified file */
+void save_settings(const char* filename) {
+    pthread_mutex_lock(&mutex);
+    file = fopen(filename, "w");
+    if (!file) {
+        printf("Error: Could not save settings\n");
+        pthread_mutex_unlock(&mutex);
+        return;
+    }
+    
+    /* Write current configuration to file */
+    fprintf(file, "waveform=%s\n",
+        state.type == SINE ? "sine" :
+        state.type == SQUARE ? "square" :
+        state.type == TRIANGLE ? "triangle" :
+        state.type == SAWTOOTH ? "sawtooth" :
+        state.type == PULSE ? "pulse" :
+        state.type == CARDIAC ? "cardiac" : "nothing");
+    fprintf(file, "freq=%.2f\n", state.frequency);
+    fprintf(file, "amp=%d\n", state.amplitude);
+    
+    fclose(file);
+    printf("Settings saved successfully.");
+    pthread_mutex_unlock(&mutex);
+}
+
+/* Load settings from specified file */
+int load_settings(const char* filename) {
+    char line[256];
+    char* equals;
+    char* value;
+    char* newline;
+    int len;
+    
+    if (!filename || strlen(filename) == 0) {
+        printf("Error: Invalid filename\n");
+        return 0;
     }
 
-    parse_arguments(argc, argv);
-    printf("\nWelcome to the waveform generator program!\n");
-    printf("Switch off the top switch to kill the program.\n");
-    printf("Toggle the other switch to trigger keyboard input.\n");
-    printf("Turn the potentiometer to change the amplitude anytime.\n");
-    printf("Current settings - Waveform: %s, Frequency: %i\n", temp_waveform, freq);
-
-	init_hardware();
-		
-	// thread functions
-	pthread_create(NULL, NULL, &userInput, NULL);
-	pthread_create(NULL, NULL, &dataGenerate, NULL);
-	return waveGenerate();
+    pthread_mutex_lock(&mutex);
+    file = fopen(filename, "r");
+    if (!file) {
+        printf("Could not open %s for reading\n", filename);
+        pthread_mutex_unlock(&mutex);
+        return 0;
+    }
+    
+    /* Parse configuration file line by line */
+    while (fgets(line, sizeof(line), file)) {
+        /* Remove trailing newline */
+        newline = strchr(line, '\n');
+        if (newline) *newline = '\0';
+        
+        equals = strchr(line, '=');
+        if (equals) {
+            *equals = '\0';  /* Split at equals sign */
+            value = equals + 1;
+            
+            /* Remove leading whitespace from value */
+            while (*value && isspace(*value)) value++;
+            
+            /* Update program state based on setting */
+            if (strcmp(line, "wave_type") == 0) {
+                int type = atoi(value);
+                if (type >= SINE && type <= NOTHING) {
+                    type = type;
+                }
+            }
+            else if (strcmp(line, "frequency") == 0) {
+                float freq = atof(value);
+                if (freq >= 1 && freq <= 1000) {
+                    state.frequency = freq;
+                }
+            }
+            else if (strcmp(line, "amplitude") == 0) {
+                int amp = atoi(value);
+                if (amp >= 0 && amp <= 100) {
+                    state.amplitude = amp;
+                }
+            }
+        }
+    }
+    
+    fclose(file);
+    printf("Settings loaded from %s\n", filename);
+    pthread_mutex_unlock(&mutex);
+    return 1;
 }
+
+/* Handle user input commands */
+void* input_thread(void* arg) {
+    char input[50];
+    char filename[256];
+    int len;
+
+    /* Enable thread cancellation */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+    while(state.running) {
+        /* Display appropriate prompt based on mode */
+        if (mode == 1) {
+            printf("\nEnter command (type 'help' for options): ");
+        } else {
+            printf("\nEnter 'quit' to exit or 'help' for options: ");
+        }
+        fflush(stdout);
+        
+        /* Read user input */
+        if (fgets(input, sizeof(input), stdin) == NULL) {
+            if (!state.running) break;
+            continue;
+        }
+        
+        /* Remove trailing newline */
+        len = strlen(input);
+        if (len > 0 && input[len-1] == '\n') {
+            input[len-1] = '\0';
+            len--;
+        }
+        
+        if (len == 0) continue;
+
+        /* Process commands */
+        if(strcmp(input, "help") == 0) {
+            printf("Commands:\n");
+            if (mode == 1) {
+                printf("sine, square, triangle, sawtooth, pulse, cardiac - Change waveform\n");
+                printf("freq <value> - Set frequency (1-1000 Hz)\n");
+                printf("amp <value> - Set amplitude (0-100%%)\n");
+                printf("save <filename> - Save current settings\n");
+                printf("load <filename> - Load settings from file\n");
+            }
+            printf("quit - Exit program\n");
+        }
+        else if(strcmp(input, "quit") == 0) {
+            save_default_settings();
+            printf("Saved current settings as default\n");
+            state.running = 0;
+            break;
+        }
+        else if(mode == 1) {
+            /* Process keyboard mode commands */
+            if(strcmp(input, "sine") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = SINE;
+                printf("\n Setting to SINE\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "square") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = SQUARE;
+                printf("\n Setting to SQUARE\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "triangle") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = TRIANGLE;
+                printf("\n Setting to TRIANGLE\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "sawtooth") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = SAWTOOTH;
+                printf("\n Setting to SAWTOOTH\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "pulse") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = PULSE;
+                printf("\n Setting to PULSE\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "cardiac") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.type = CARDIAC;
+                printf("\n Setting to CARDIAC\n");
+                generate_waveform();
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strcmp(input, "quit") == 0) {
+                pthread_mutex_lock(&mutex);
+                state.running = 0;
+                printf("\n Quitting the program.\n");
+                pthread_mutex_unlock(&mutex);
+            }
+            else if(strncmp(input, "freq ", 5) == 0) {
+                freq = atoi(&input[5]);
+                if (freq >= 1 && freq <= 1000) {
+                    pthread_mutex_lock(&mutex);
+                    state.frequency = freq;
+                    printf("\nFrequency set to %d Hz\n", freq);
+                    pthread_mutex_unlock(&mutex);
+                } else {
+                    printf("Invalid frequency. Must be 1 - 1000Hz\n");
+                }
+            }
+            else if(strncmp(input, "amp ", 4) == 0) {
+                amp =  atoi(&input[4]);
+                if (amp >= 0 && amp <= 100) {
+                    pthread_mutex_lock(&mutex);
+                    state.amplitude = amp;
+                    printf("\n Amplitude set to %d %\n", amp);
+                    generate_waveform();
+                    pthread_mutex_unlock(&mutex);
+                } else {
+                    printf("Invalid amplitude. Must be 1 - 100 %\n");
+                }
+            }
+            else if(strncmp(input, "save ", 5) == 0) {
+                if (len <= 5) {
+                    printf("Error: Please specify a filename\n");
+                    continue;
+                }
+                strncpy(filename, input + 5, sizeof(filename) - 1);
+                filename[sizeof(filename) - 1] = '\0';
+                save_settings(filename);
+            }
+            else if(strncmp(input, "load ", 5) == 0) {
+                if (len <= 5) {
+                    printf("Error: Please specify a filename\n");
+                    continue;
+                }
+                strncpy(filename, input + 5, sizeof(filename) - 1);
+                filename[sizeof(filename) - 1] = '\0';
+                if (read_config_file(filename)) {
+                	printf("Loaded new file settings.");
+                    generate_waveform();
+                }
+            }
+        }
+        else if(mode == 2) {
+            printf("In potentiometer mode. Only 'help' and 'quit' commands are available.\n");
+        }
+    }
+    return NULL;
+}
+
+/* Generate and output waveform data in real-time */
+void* waveform_thread(void* arg) {
+    struct timespec start, now;
+    double period_ns;
+    int point_index = 0;
+    char buffer[256];
+    int len;
+    float current_freq;
+    unsigned short output_value;
+
+    /* Enable thread cancellation */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    
+    /* Initialize waveform and logging */
+    generate_waveform();
+    write_file();
+    
+    while(state.running) {
+        /* Get current waveform parameters */
+        pthread_mutex_lock(&mutex);
+        current_freq = state.frequency;
+        output_value = (unsigned short)state.data[point_index];
+        pthread_mutex_unlock(&mutex);
+
+        /* Calculate timing for current frequency */
+        period_ns = (1000000000.0 / (current_freq * POINTS_PER_CYCLE));
+
+        /* Send data to DAC */
+        out16(DA_CTLREG, 0x0a23);
+        out16(DA_FIFOCLR, 0);
+        out16(DA_Data, output_value);
+
+        /* Log waveform point */
+        len = sprintf(buffer, "Point %d: Value = 0x%04X\n", 
+                     point_index, output_value);
+        write(fd, buffer, len);
+
+        /* Update waveform position */
+        point_index = (point_index + 1) % POINTS_PER_CYCLE;
+
+        /* Audio feedback on cycle completion */
+        if (point_index == 0) {
+            printf("\a");
+            fflush(stdout);
+        }
+
+        /* Maintain precise timing */
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        do {
+            clock_gettime(CLOCK_MONOTONIC, &now);
+        } while ((now.tv_sec - start.tv_sec) * 1000000000 + 
+                 (now.tv_nsec - start.tv_nsec) < period_ns);
+    }
+
+    close(fd);
+    return NULL;
+}
+
+/* Handle program termination signals */
+void signal_handler(int sig) {
+    if(sig == SIGINT) {
+        pthread_mutex_lock(&mutex);
+        printf("\nCleaning up...\n");
+        state.running = 0;
+
+        /* Save settings before exit */
+        save_default_settings();
+        printf("Saved current settings as default\n");
+
+        /* Close log file if open */
+        if (fd > 0) {
+            char buffer[256];
+            int len = sprintf(buffer, "\nProgram terminated by user\n");
+            write(fd, buffer, len);
+            close(fd);
+        }
+        pthread_mutex_unlock(&mutex);
+
+        /* Terminate all running threads */
+        pthread_cancel(input_tid);
+        pthread_cancel(wave_tid);
+        if (mode == 2) {
+            pthread_cancel(analog_tid);
+        }
+
+        /* Clean exit */
+        usleep(1000);
+        signal(SIGINT, SIG_DFL);
+        write(STDOUT_FILENO, "\nExiting Program\n", 18);
+        exit(0);
+    }
+}
+
+/* Display program usage information */
+void print_usage(char* program_name) {
+    printf("Usage: %s -w wave_type -f frequency -a amplitude\n", program_name);
+    printf("  wave_type: sine, square, triangle, sawtooth, pulse, cardiac\n");
+    printf("  frequency: 1-1000 Hz\n");
+    printf("  amplitude: 0-100%%\n");
+    printf("Example: %s -w sine -f 100 -a 50\n", program_name);
+}
+
+/* Read and process potentiometer inputs */
+void* analog_input_thread(void* arg) {
+    int write_len;
+    char log_buffer[256];
+    double scaled_freq;
+    double scaled_amp;
+
+    /* Enable thread cancellation */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    
+    /* Initialize ADC hardware */
+    out16(INTERRUPT, 0x60c0);
+    out16(TRIGGER, 0x2081);
+    out16(AUTOCAL, 0x007f);
+    out16(AD_FIFOCLR, 0);
+    out16(MUXCHAN, 0x0D00);
+
+    printf("\nStarting analog input monitoring...\n");
+    
+    count = 0;
+    while(state.running) {
+        pthread_mutex_lock(&mutex);
+        
+        /* Configure and read ADC channel */
+        chan = ((count & 0x0f) << 4) | (0x0f & count);
+        out16(MUXCHAN, 0x0D00 | chan);
+        delay(1);
+        out16(AD_DATA, 0);
+        
+        /* Wait for ADC conversion */
+        while(!(in16(MUXCHAN) & 0x4000));
+        adc_in = in16(AD_DATA);
+
+        /* Process frequency potentiometer */
+        if(count == 0) {
+            double normalized = (double)adc_in / 65535.0;
+            scaled_freq = MIN_FREQ + (pow(normalized, 2) * (MAX_FREQ - MIN_FREQ));
+            state.frequency = round(scaled_freq);
+            
+            write_len = sprintf(log_buffer, "Frequency updated: %.2f Hz\n", state.frequency);
+            write(fd, log_buffer, write_len);
+        }
+        /* Process amplitude potentiometer */
+        else if(count == 1) {
+            scaled_amp = ((double)adc_in / 65535.0) * 100;
+            state.amplitude = (int)scaled_amp;
+            
+            write_len = sprintf(log_buffer, "Amplitude updated: %d%%\n", state.amplitude);
+            write(fd, log_buffer, write_len);
+            
+            generate_waveform();
+        }
+
+        /* Update display */
+        printf("\rCurrent: Freq = %.2f Hz, Amp = %d%%    ", state.frequency, state.amplitude);
+        fflush(stdout);
+
+        /* Switch between channels */
+        count = (count + 1) % 2;
+        delay(1);
+
+        pthread_mutex_unlock(&mutex);
+    }
+
+    printf("\nAnalog input monitoring stopped\n");
+    return NULL;
+}
+
+/* Load and parse configuration file */
+int read_config_file(const char* filename) {
+    char line[256];
+    char param_name[32];
+    char param_value[32];
+    FILE* config_file;
+    int success = 0;
+    
+    /* Validate input */
+    if(!filename) {
+        printf("Error: No filename provided\n");
+        return 0;
+    }
+
+    pthread_mutex_lock(&mutex);
+    
+    /* Open configuration file */
+    config_file = fopen(filename, "r");
+    if(!config_file) {
+        printf("Could not open configuration file: %s\n", filename);
+        pthread_mutex_unlock(&mutex);
+        return 0;
+    }
+    
+    /* Process each line in config file */
+    while(fgets(line, sizeof(line), config_file)) {
+        /* Skip empty lines and comments */
+        if(line[0] == '\n' || line[0] == '#') {
+            continue;
+        }
+        
+        /* Parse parameter-value pairs */
+        if(sscanf(line, "%31[^=]=%31s", param_name, param_value) == 2) {
+            /* Clean up parameter name */
+            char* end = param_name + strlen(param_name) - 1;
+            while(end > param_name && isspace(*end)) {
+                *end-- = '\0';
+            }
+            
+            /* Update program settings */
+            if(strcmp(param_name, "waveform") == 0) {
+                if(strcmp(param_value, "sine") == 0) state.type = SINE;
+                else if(strcmp(param_value, "square") == 0) state.type = SQUARE;
+                else if(strcmp(param_value, "triangle") == 0) state.type = TRIANGLE;
+                else if(strcmp(param_value, "sawtooth") == 0) state.type = SAWTOOTH;
+                else if(strcmp(param_value, "pulse") == 0) state.type = PULSE;
+                else if(strcmp(param_value, "cardiac") == 0) state.type = CARDIAC;
+                success = 1;
+            }
+            else if(strcmp(param_name, "freq") == 0) {
+                float f = atof(param_value);
+                if(f >= MIN_FREQ && f <= MAX_FREQ) {
+                    state.frequency = f;
+                    success = 1;
+                }
+            }
+            else if(strcmp(param_name, "amp") == 0) {
+                int a = atoi(param_value);
+                if(a >= 0 && a <= 100) {
+                    state.amplitude = a;
+                    success = 1;
+                }
+            }
+        }
+    }
+    
+    fclose(config_file);
+    
+    if(success) {
+        printf("Configuration loaded from %s\n", filename);
+        generate_waveform();
+    }
+    
+    pthread_mutex_unlock(&mutex);
+    return success;
+}
+
+/* Display input mode selection menu */
+void print_mode_selection(void) {
+    printf("\nSelect input mode:\n");
+    printf("1. Keyboard input\n");
+    printf("2. Potentiometer input\n");
+    printf("Enter mode (1 or 2): ");
+}
+
+/* Program entry point */
+int main(int argc, char* argv[]) {
+    char mode_input[10];
+    
+    /* Initialize program state */
+    state.type = SQUARE;
+    state.frequency = 1;
+    state.amplitude = 100;
+    state.running = 1;
+    state.data = malloc(POINTS_PER_CYCLE * sizeof(unsigned int));
+    pthread_mutex_init(&mutex, NULL);
+
+    /* Load saved settings if available */
+    if(access("default.txt", F_OK) != -1) {
+        printf("Loading default settings...\n");
+        if(load_settings("default.txt")) {
+            printf("Default settings loaded successfully\n");
+        } else {
+            printf("Error loading default settings, using program defaults\n");
+        }
+    }
+
+    /* Process command line arguments */
+    if(argc == 1) {
+        printf("\nNo arguments provided. You can start the program with initial settings using:\n");
+        print_usage(argv[0]);
+        if (read_config_file("default.txt")) {
+            printf("\nStarting with current settings...\n");
+        }
+    } 
+    else {
+        /* Parse command line options */
+        for(i = 1; i < argc; i++) {
+            if(strcmp(argv[i], "-h") == 0) {
+                print_usage(argv[0]);
+                return 0;
+            }
+            else if(strcmp(argv[i], "-w") == 0) {
+                /* Set waveform type */
+                if(i + 1 >= argc) {
+                    printf("Error: -w requires a wave type\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                i++;
+                if(strcmp(argv[i], "sine") == 0) state.type = SINE;
+                else if(strcmp(argv[i], "square") == 0) state.type = SQUARE;
+                else if(strcmp(argv[i], "triangle") == 0) state.type = TRIANGLE;
+                else if(strcmp(argv[i], "sawtooth") == 0) state.type = SAWTOOTH;
+                else if(strcmp(argv[i], "pulse") == 0) state.type = PULSE;
+                else if(strcmp(argv[i], "cardiac") == 0) state.type = CARDIAC;
+                else {
+                    printf("Invalid wave type: %s\n", argv[i]);
+                    print_usage(argv[0]);
+                    return 1;
+                }
+            }
+            else if(strcmp(argv[i], "-f") == 0) {
+                /* Set frequency */
+                if(i + 1 >= argc) {
+                    printf("Error: -f requires a frequency value\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                i++;
+                state.frequency = atoi(argv[i]);
+                if(state.frequency < 1 || state.frequency > 1000) {
+                    printf("Frequency must be between 1 and 1000 Hz\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+            }
+            else if(strcmp(argv[i], "-a") == 0) {
+                /* Set amplitude */
+                if(i + 1 >= argc) {
+                    printf("Error: -a requires an amplitude value\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+                i++;
+                state.amplitude = atoi(argv[i]);
+                if(state.amplitude < 0 || state.amplitude > 100) {
+                    printf("Amplitude must be between 0 and 100%%\n");
+                    print_usage(argv[0]);
+                    return 1;
+                }
+            }
+            else {
+                printf("Unknown option: %s\n", argv[i]);
+                print_usage(argv[0]);
+                return 1;
+            }
+        }
+        printf("\nCommand line arguments override default settings.\n");
+    }
+
+    /* Display current configuration */
+    printf("\nCurrent settings:\n");
+    printf("Waveform: %s\n", 
+        state.type == SINE ? "sine" :
+        state.type == SQUARE ? "square" :
+        state.type == TRIANGLE ? "triangle" :
+        state.type == SAWTOOTH ? "sawtooth" :
+        state.type == PULSE ? "pulse" :
+        state.type == CARDIAC ? "cardiac" : "unknown");
+    printf("Frequency: %.2f Hz\n", state.frequency);
+    printf("Amplitude: %d%%\n", state.amplitude);
+
+    /* Initialize hardware and signal handling */
+    init_hardware();
+    signal(SIGINT, signal_handler);
+    generate_waveform();
+
+    /* Get user input mode */
+    printf("\n=== Input Mode Selection ===\n");
+    print_mode_selection();
+    if (fgets(mode_input, sizeof(mode_input), stdin) != NULL) {
+        mode = atoi(mode_input);
+        if (mode != 1 && mode != 2) {
+            printf("Invalid mode. Defaulting to keyboard input.\n");
+            mode = 1;
+        }
+    } else {
+        printf("Error reading input. Defaulting to keyboard input.\n");
+        mode = 1;
+    }
+
+    /* Create program threads */
+    pthread_create(&input_tid, NULL, input_thread, NULL);
+    pthread_create(&wave_tid, NULL, waveform_thread, NULL);
+    
+    if (mode == 2) {
+        pthread_create(&analog_tid, NULL, analog_input_thread, NULL);
+        printf("\nPotentiometer mode active. Use pots to control frequency and amplitude.\n");
+        printf("Type 'quit' to exit program.\n");
+    }
+
+    /* Wait for threads to complete */
+    pthread_join(input_tid, NULL);
+    pthread_join(wave_tid, NULL);
+    if (mode == 2) {
+        pthread_join(analog_tid, NULL);
+    }
+
+    /* Cleanup and exit */
+    pthread_mutex_destroy(&mutex);
+    free(state.data);
+    pci_detach_device(hdl);
+    printf("End of Program\n");
+    
+    return 0;
+}
+
